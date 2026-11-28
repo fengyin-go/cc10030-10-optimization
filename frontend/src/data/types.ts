@@ -18,6 +18,10 @@ export type ModuleMeta = {
   actions: string[]
   actionTargets: Record<string, string>
   metrics: string[]
+  /** 由后端补注/托管的字段：列表中展示，但登记表单不要求手工填写。 */
+  readonlyFields?: string[]
+  /** 动作需要补充说明（如换船的新船舶编号、调整后的吨数），执行前弹窗收集。 */
+  remarkActions?: string[]
 }
 
 export type PageResult = {

@@ -5,6 +5,7 @@ from app.services.vessel import VesselService
 from app.services.route import RouteService
 from app.services.voyage import VoyageService
 from app.services.cargo import CargoService
+from app.services.load_quota import LoadQuotaService
 from app.services.crew_shift import CrewShiftService
 from app.services.manifest import ManifestService
 from app.services.charter import CharterService
@@ -25,14 +26,41 @@ def _create_test_vessel(svc, name, dwt="50000", ton="30000"):
     return entry["id"]
 
 
-def _create_test_voyage(svc, vessel_id, route_id=3, departure="2026-12-01"):
+def _create_test_voyage(svc, vessel_id, route_id=3, departure="2026-12-01", arrival="2026-12-10"):
     entry, result = svc.create_entry({
         "船舶编号": vessel_id,
         "航线编号": route_id,
         "计划离港": departure,
+        "计划到港": arrival,
     })
     if entry is None:
         raise RuntimeError(f"创建测试航次失败: {result}")
+    return entry["id"]
+
+
+def _create_test_cargo(svc, voyage_id, name="测试货", tons="10"):
+    entry, result = svc.create_entry({
+        "货物品名": name,
+        "托运方": "测试公司",
+        "件数": "100",
+        "总吨数": tons,
+        "装载航次": voyage_id,
+    })
+    if entry is None:
+        raise RuntimeError(f"创建测试货物失败: {result}")
+    return entry["id"]
+
+
+def _issue_quota(svc, vessel_id, voyage_id, cargo_id, tons):
+    entry, result = svc.create_entry({
+        "船舶编号": vessel_id,
+        "航次编号": voyage_id,
+        "货物编号": cargo_id,
+        "预留吨数": str(tons),
+        "申请货代": "测试货代",
+    })
+    if entry is None:
+        raise RuntimeError(f"签发装载额度回执失败: {result}")
     return entry["id"]
 
 
@@ -68,7 +96,7 @@ class TestVesselRouteToVoyage:
 
 
 class TestVoyageToCargo:
-    """链路2：航次→货物"""
+    """链路2：航次→货物→装载额度回执"""
 
     def test_cargo_tonnage_exceeds_dwt(self):
         vessel_svc = VesselService()
@@ -77,14 +105,21 @@ class TestVoyageToCargo:
         voyage_id = _create_test_voyage(voyage_svc, vessel_id)
 
         cargo_svc = CargoService()
-        entry, result = cargo_svc.create_entry({
-            "货物品名": "铁矿石",
-            "托运方": "测试公司",
-            "件数": "1000",
-            "总吨数": "999",
-            "装载航次": voyage_id,
+        cargo_id = _create_test_cargo(cargo_svc, voyage_id, tons="999")
+
+        # 货物登记允许先挂账等待配载，但申请额度回执时必须按载重阈值拦截
+        quota_svc = LoadQuotaService()
+        quota, result = quota_svc.create_entry({
+            "船舶编号": vessel_id,
+            "航次编号": voyage_id,
+            "货物编号": cargo_id,
+            "预留吨数": "999",
         })
-        assert entry is None, f"超载吨位应拦截: {result}"
+        assert quota is None, f"超载吨位应在额度回执环节拦截: {result}"
+
+        # 没有有效回执时确认装载同样被拒绝
+        loaded, msg = cargo_svc.run_action(cargo_id, "确认装载")
+        assert loaded is None and "装载额度回执" in msg
 
     def test_cargo_tonnage_within_dwt(self):
         vessel_svc = VesselService()
@@ -190,15 +225,12 @@ class TestCargoToManifest:
         voyage_id = _create_test_voyage(voyage_svc, vessel_id)
 
         cargo_svc = CargoService()
-        cargo, _ = cargo_svc.create_entry({
-            "货物品名": "煤炭",
-            "托运方": "测试",
-            "件数": "50",
-            "总吨数": "3",
-            "装载航次": voyage_id,
-        })
-        assert cargo is not None
-        cargo_svc.run_action(cargo["id"], "确认装载")
+        cargo_id = _create_test_cargo(cargo_svc, voyage_id, name="煤炭", tons="3")
+        quota_svc = LoadQuotaService()
+        quota_id = _issue_quota(quota_svc, vessel_id, voyage_id, cargo_id, 3)
+        result, msg = cargo_svc.run_action(cargo_id, "确认装载")
+        assert result is not None, f"凭有效回执确认装载应成功: {msg}"
+        assert result["额度回执"] == quota_id
 
         manifest_svc = ManifestService()
         manifest, _ = manifest_svc.create_entry({

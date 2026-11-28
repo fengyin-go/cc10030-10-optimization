@@ -18,8 +18,13 @@ class WeatherAlertService(BaseModuleService):
     ACTION_RULES = {"签收预警": "已签收", "调整航次": "已签收", "解除预警": "已解除"}
     NEGATIVE_ACTIONS = []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
-        result, msg = super().run_action(entry_id, action)
+    def run_action(
+        self,
+        entry_id: int,
+        action: str,
+        remark: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        result, msg = super().run_action(entry_id, action, remark)
         # 签收预警时自动标记受影响航次
         if result is not None and action == "签收预警":
             alert = store.find(self.MODULE, entry_id)

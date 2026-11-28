@@ -29,11 +29,33 @@ export async function runAction(
   key: string,
   id: number,
   action: string,
+  remark?: string,
 ): Promise<ActionResult> {
   const response = await request(`/api/${key}/${id}/actions`, {
     method: 'POST',
-    body: JSON.stringify({ action }),
+    body: JSON.stringify({ action, remark }),
   })
+  return await response.json()
+}
+
+export type CargoReadiness = {
+  cargo_id: number
+  ready: boolean
+  stage: string
+  reason: string
+  vessel_quota: {
+    available: number | null
+    dwt: number | null
+    occupied: number
+    earliest_free: string | null
+    blockers: { quota_id: number; voyage_id: string; cargo_id: string; status: string; tons: number }[]
+  }
+}
+
+/** 货代查询某票货物的配载状态：还在等待、已能履约，以及额度何时能继续。 */
+export async function loadCargoReadiness(id: number): Promise<CargoReadiness> {
+  const response = await request(`/api/cargo/${id}/readiness`)
+  if (!response.ok) throw new Error('配载状态查询失败')
   return await response.json()
 }
 

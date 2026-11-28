@@ -59,7 +59,12 @@ class BaseModuleService:
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self,
+        entry_id: int,
+        action: str,
+        remark: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
@@ -69,6 +74,8 @@ class BaseModuleService:
         entry["status"] = target
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        if remark:
+            entry["备注说明"] = str(remark)
         return entry, f"{self.ENTITY}已{action}"
 
     def domain_snapshot(self) -> dict[str, Any]:

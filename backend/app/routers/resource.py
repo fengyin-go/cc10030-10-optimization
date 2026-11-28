@@ -85,14 +85,39 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
 @router.post("/{module}", response_model=ActionResult)
 def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)
-    entry, missing = service.create_entry(payload.values)
-    if missing:
-        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    entry, result = service.create_entry(payload.values)
+    if entry is None:
+        # 领域服务可能返回缺失字段列表，也可能直接返回跨模块校验失败原因
+        if isinstance(result, list):
+            return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(result)}")
+        return ActionResult(ok=False, message=str(result))
     return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    entry, message = service.run_action(entry_id, payload.action.strip(), payload.remark)
     return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.get("/cargo/{entry_id}/readiness", response_model=dict)
+def cargo_readiness(entry_id: int) -> dict[str, Any]:
+    """货代查询某票货物的配载状态：还在等待、已能履约，以及何时能继续。"""
+    from app.services.cross_module import cargo_loading_readiness, quota_availability
+    from app.store import store as data_store
+
+    cargo = data_store.find("cargo", entry_id)
+    if cargo is None:
+        raise HTTPException(status_code=404, detail=f"货物 {entry_id} 不存在或已归档")
+
+    readiness = cargo_loading_readiness(entry_id)
+    voyage_id = cargo.get("装载航次", "")
+    availability: dict[str, Any] = {}
+    voyage = data_store.find("voyage", voyage_id) if str(voyage_id).isdigit() else None
+    if voyage is not None:
+        from app.services.cross_module import voyage_window
+        availability = quota_availability(
+            voyage.get("船舶编号", ""), voyage_window(voyage),
+        )
+    return {"cargo_id": entry_id, **readiness, "vessel_quota": availability}

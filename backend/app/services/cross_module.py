@@ -5,9 +5,32 @@
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from datetime import date as date_type
+from typing import Any
 
 from app.store import store
+
+# 装载额度回执中仍然正式占用船舶载重吨的状态：
+# 待确认=已预约额度、已占用=已实际装载，两者都计入相交时段占用；
+# 已释放（卸货）和已撤销（换船）不再占用任何额度。
+QUOTA_ACTIVE_STATUSES = ("待确认", "已占用")
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(value))
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_iso_date(value: Any) -> date_type | None:
+    """尽量把计划离港/到港解析成日期，无法解析时返回 None。"""
+    if value in (None, ""):
+        return None
+    try:
+        return date_type.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
 
 
 def require_entity(module: str, entity_id: str | int, label: str = "") -> dict[str, Any] | None:
@@ -72,35 +95,228 @@ def voyage_exists(voyage_id: str | int) -> tuple[bool, str]:
     return True, ""
 
 
+def voyage_window(voyage: dict[str, Any]) -> tuple[date_type | None, date_type | None]:
+    """读取航次的装载时段（计划离港→计划到港）。"""
+    return (
+        _parse_iso_date(voyage.get("计划离港")),
+        _parse_iso_date(voyage.get("计划到港")),
+    )
+
+
+def windows_overlap(
+    first: tuple[date_type | None, date_type | None],
+    second: tuple[date_type | None, date_type | None],
+) -> bool:
+    """两个装载时段是否相交；任一端点缺失无法判定时按不相交处理。"""
+    start_a, end_a = first
+    start_b, end_b = second
+    if start_a is None or end_a is None or start_b is None or end_b is None:
+        return False
+    return start_a <= end_b and start_b <= end_a
+
+
+def vessel_dwt(vessel_id: str | int) -> float | None:
+    """读取船舶载重吨；船舶不存在或吨位无法解析时返回 None。"""
+    vessel = require_entity("vessel", vessel_id)
+    if vessel is None:
+        return None
+    dwt = _to_float(vessel.get("载重吨", 0))
+    return dwt if dwt > 0 else None
+
+
+def active_quota_rows(vessel_id: str | int | None = None) -> list[dict[str, Any]]:
+    """返回仍正式占用载重吨的额度回执，可按船舶过滤。"""
+    rows = [
+        row for row in store.rows("load_quota")
+        if row.get("status") in QUOTA_ACTIVE_STATUSES
+    ]
+    if vessel_id is not None:
+        rows = [row for row in rows if str(row.get("船舶编号", "")) == str(vessel_id)]
+    return rows
+
+
 def check_cargo_tonnage(voyage_id: str | int, cargo_tonnage: float) -> tuple[bool, str]:
-    """货物登记时校验航次上全部货物总吨位不超船舶载重吨。"""
+    """校验新增装载预约后，船舶在相交装载时段内的正式占用合计不超过载重吨。
+
+    同一艘船可能被调度给多个航次：把与目标航次装载时段相交的其它航次上
+    仍然有效的额度回执（待确认/已占用）一并计入；时段不相交的航次互不影响。
+    """
     voyage = require_entity("voyage", voyage_id)
     if voyage is None:
         return False, f"航次 {voyage_id} 不存在"
 
     vessel_id = voyage.get("船舶编号", "")
-    vessel = require_entity("vessel", vessel_id)
-    if vessel is None:
-        return False, f"船舶 {vessel_id} 不存在"
+    dwt = vessel_dwt(vessel_id)
+    if dwt is None:
+        return False, f"船舶 {vessel_id} 不存在或载重吨无效"
 
-    dwt_str = str(vessel.get("载重吨", "0"))
-    try:
-        dwt = float(dwt_str) if dwt_str.replace(".", "").isdigit() else 0
-    except (ValueError, TypeError):
-        dwt = 0
+    target_window = voyage_window(voyage)
+    occupied = 0.0
+    blockers: list[str] = []
+    for quota in active_quota_rows(vessel_id):
+        other_voyage = require_entity("voyage", quota.get("航次编号", ""))
+        # 同航次或装载时段相交的其它航次，其有效额度都在同一时段占用本船载重。
+        if other_voyage is not None and not (
+            str(other_voyage.get("id", "")) == str(voyage_id)
+            or windows_overlap(target_window, voyage_window(other_voyage))
+        ):
+            continue
+        occupied += _to_float(quota.get("预留吨数", 0))
+        blockers.append(
+            f"航次{quota.get('航次编号', '')}回执{quota.get('id', '')}"
+            f"（{quota.get('status', '')} {quota.get('预留吨数', 0)}吨）"
+        )
 
-    # 计算现有货物总吨位
-    existing_tonnage = 0.0
-    for cargo_row in store.rows("cargo"):
-        if str(cargo_row.get("装载航次", "")) == str(voyage_id) and cargo_row.get("status") != "已卸货":
-            try:
-                existing_tonnage += float(str(cargo_row.get("总吨数", 0)))
-            except (ValueError, TypeError):
-                pass
-
-    if existing_tonnage + cargo_tonnage > dwt:
-        return False, f"货物总吨位 {existing_tonnage + cargo_tonnage} 超过船舶载重吨 {dwt}"
+    if occupied + cargo_tonnage > dwt:
+        detail = "、".join(blockers) if blockers else "当前无其它占用"
+        return False, (
+            f"相交装载时段内正式占用合计 {occupied + cargo_tonnage} 吨"
+            f"超过船舶载重吨 {dwt:g} 吨；已占用：{detail}"
+        )
     return True, ""
+
+
+def quota_for_cargo(cargo_id: str | int) -> dict[str, Any] | None:
+    """找到关联某票货物的最新额度回执（含已撤销/已释放的历史回执）。"""
+    matches = [
+        quota for quota in store.rows("load_quota")
+        if str(quota.get("货物编号", "")) == str(cargo_id)
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda quota: int(quota.get("id", 0)))
+
+
+def active_quota_for_cargo(cargo_id: str | int) -> dict[str, Any] | None:
+    """找到关联某票货物且仍然有效（待确认/已占用）的额度回执。"""
+    active = [
+        quota for quota in store.rows("load_quota")
+        if str(quota.get("货物编号", "")) == str(cargo_id)
+        and quota.get("status") in QUOTA_ACTIVE_STATUSES
+    ]
+    if not active:
+        return None
+    return max(active, key=lambda quota: int(quota.get("id", 0)))
+
+
+def cargo_loading_readiness(cargo_id: str | int) -> dict[str, Any]:
+    """货代视角的配载状态：换船后还在等待 vs 已经能履约，以及何时能继续。"""
+    cargo = require_entity("cargo", cargo_id)
+    if cargo is None:
+        return {"ready": False, "stage": "不存在", "reason": f"货物 {cargo_id} 不存在", "blockers": []}
+    if cargo.get("status") in ("已装载", "已卸货"):
+        return {
+            "ready": True,
+            "stage": "已能履约" if cargo.get("status") == "已装载" else "已卸货",
+            "reason": "该票货物已取得装载资格并完成装载",
+            "blockers": [],
+        }
+
+    quota = active_quota_for_cargo(cargo_id)
+    if quota is None:
+        history = quota_for_cargo(cargo_id)
+        if history is not None and history.get("status") == "已撤销":
+            return {
+                "ready": False,
+                "stage": "等待配载",
+                "reason": (
+                    f"原关联船舶 {history.get('船舶编号', '')} 的额度回执"
+                    f"{history.get('id', '')} 已随换船撤销，需要重新申请装载额度回执"
+                ),
+                "blockers": [],
+            }
+        return {
+            "ready": False,
+            "stage": "等待配载",
+            "reason": "尚未取得关联本航次和船舶的装载额度回执，不能确认装载",
+            "blockers": [],
+        }
+
+    voyage = require_entity("voyage", quota.get("航次编号", ""))
+    if voyage is None:
+        return {
+            "ready": False,
+            "stage": "等待配载",
+            "reason": f"回执 {quota.get('id', '')} 关联的航次不存在",
+            "blockers": [],
+        }
+    if str(cargo.get("装载航次", "")) != str(voyage.get("id", "")):
+        return {
+            "ready": False,
+            "stage": "等待配载",
+            "reason": (
+                f"回执 {quota.get('id', '')} 属于航次 {voyage.get('id', '')}，"
+                f"与货物当前装载航次 {cargo.get('装载航次', '')} 不一致，疑似已换船"
+            ),
+            "blockers": [],
+        }
+
+    # 回执有效：说明额度已预留，货代可以凭回执确认装载。
+    return {
+        "ready": True,
+        "stage": "已能履约",
+        "reason": f"装载额度回执 {quota.get('id', '')} 有效，可确认装载",
+        "quota_id": quota.get("id"),
+        "blockers": [],
+    }
+
+
+def quota_availability(vessel_id: str | int, window: tuple[date_type | None, date_type | None]) -> dict[str, Any]:
+    """查询某艘船在给定装载时段内的剩余额度，以及占用来源和最早释放时间。"""
+    dwt = vessel_dwt(vessel_id)
+    if dwt is None:
+        return {"available": None, "dwt": None, "occupied": 0.0, "blockers": []}
+
+    occupied = 0.0
+    blockers: list[dict[str, Any]] = []
+    earliest_free: date_type | None = None
+    for quota in active_quota_rows(vessel_id):
+        other_voyage = require_entity("voyage", quota.get("航次编号", ""))
+        other_window = voyage_window(other_voyage) if other_voyage else (None, None)
+        if other_voyage is not None and not (
+            windows_overlap(window, other_window)
+            or (window[0] is None or window[1] is None)
+        ):
+            continue
+        tons = _to_float(quota.get("预留吨数", 0))
+        occupied += tons
+        blockers.append({
+            "quota_id": quota.get("id"),
+            "voyage_id": quota.get("航次编号", ""),
+            "cargo_id": quota.get("货物编号", ""),
+            "status": quota.get("status", ""),
+            "tons": tons,
+        })
+        # 相交航次的计划到港就是该笔占用最早可能释放的时刻。
+        if other_window[1] is not None and (earliest_free is None or other_window[1] < earliest_free):
+            earliest_free = other_window[1]
+
+    return {
+        "available": max(dwt - occupied, 0.0),
+        "dwt": dwt,
+        "occupied": occupied,
+        "blockers": blockers,
+        "earliest_free": earliest_free.isoformat() if earliest_free else None,
+    }
+
+
+def revoke_pending_quotas_for_voyage(voyage_id: str | int) -> list[dict[str, Any]]:
+    """换船时撤下该航次上还没实际装载（待确认）的额度回执，返回被撤销的回执列表。
+
+    已占用（已实际装载）和已释放/已撤销的回执不动：前者是真实在船货物，
+    后者已经不占用任何额度。
+    """
+    revoked: list[dict[str, Any]] = []
+    for quota in store.rows("load_quota"):
+        if str(quota.get("航次编号", "")) != str(voyage_id):
+            continue
+        if quota.get("status") != "待确认":
+            continue
+        quota["status"] = "已撤销"
+        quota["pending"] = False
+        quota["abnormal"] = True
+        revoked.append(quota)
+    return revoked
 
 
 def check_crew_shift_overlap(
@@ -296,7 +512,7 @@ CROSS_CHAINS = {
         "checks": [vessel_confirmed, route_confirmed],
     },
     "voyage_to_cargo": {
-        "description": "货物登记→关联未完成航次→总吨位不超载重吨",
+        "description": "货物登记→关联未完成航次→装载额度回执按相交时段核对载重吨",
         "checks": [voyage_not_completed],
         "tonnage_check": check_cargo_tonnage,
     },

@@ -14,6 +14,8 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 装载额度回执为运行期业务凭证，初始为空表。
+        self._tables.setdefault("load_quota", [])
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)

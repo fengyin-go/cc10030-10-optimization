@@ -16,6 +16,7 @@ from app.services.vessel import VesselService
 from app.services.route import RouteService
 from app.services.voyage import VoyageService
 from app.services.cargo import CargoService
+from app.services.load_quota import LoadQuotaService
 from app.services.crew_shift import CrewShiftService
 from app.services.charter import CharterService
 from app.services.manifest import ManifestService
@@ -174,6 +175,14 @@ class TestDuplicateManifest:
             "装载航次": voyage_id,
         })
         assert cargo is not None
+        quota_svc = LoadQuotaService()
+        quota, _ = quota_svc.create_entry({
+            "船舶编号": vessel_id,
+            "航次编号": voyage_id,
+            "货物编号": cargo["id"],
+            "预留吨数": "5",
+        })
+        assert quota is not None
         cargo_svc.run_action(cargo["id"], "确认装载")
 
         manifest_svc = ManifestService()
